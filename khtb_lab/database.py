@@ -1,11 +1,56 @@
 from __future__ import annotations
-import json,math,sqlite3
+import json,math,sqlite3,threading
+from functools import wraps
 from pathlib import Path
 from datetime import datetime,timezone,date
 from .local_learning import FEATURE_NAMES,MODEL_VERSION
+
+
+def _serialized(method):
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+def _serialize_database_methods(cls):
+    methods = (
+        "_init",
+        "seed_symbols",
+        "list_symbols",
+        "enabled_symbols",
+        "add_symbol",
+        "set_symbol",
+        "remove_symbol",
+        "save_signal",
+        "open_trade",
+        "open_trades",
+        "trade_followup",
+        "update_trade_stop",
+        "save_trade_management",
+        "save_trade_followup",
+        "mark_trade_followup_event",
+        "close_trade",
+        "set_value",
+        "get_value",
+        "local_learning_examples",
+        "recent_trades",
+        "daily_pnl",
+        "stats",
+        "close",
+    )
+    for name in methods:
+        setattr(cls, name, _serialized(getattr(cls, name)))
+    return cls
+
+
+@_serialize_database_methods
 class Database:
     def __init__(self,path):
         self.path=path
+        self._lock=threading.RLock()
         if path!=":memory:":Path(path).parent.mkdir(parents=True,exist_ok=True)
         self.conn=sqlite3.connect(path,check_same_thread=False);self.conn.row_factory=sqlite3.Row;self.conn.execute("PRAGMA journal_mode=WAL");self._init()
     def _init(self):

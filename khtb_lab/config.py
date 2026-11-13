@@ -174,6 +174,10 @@ class Settings:
         "SCAN_SECONDS", 60
     )
 
+    position_manager_seconds: int = _int(
+        "POSITION_MANAGER_SECONDS", 15
+    )
+
     timeframe_main: str = os.getenv(
         "TIMEFRAME_MAIN", "15m"
     )
@@ -312,6 +316,11 @@ class Settings:
         if self.scan_seconds < 5:
             raise ValueError(
                 "SCAN_SECONDS must be >=5"
+            )
+
+        if self.position_manager_seconds < 1:
+            raise ValueError(
+                "POSITION_MANAGER_SECONDS must be >=1"
             )
 
         if self.request_timeout < 1:

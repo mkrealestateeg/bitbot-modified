@@ -444,7 +444,7 @@ class TelegramBot:
                     self.keyboard(),
                 )
             else:
-                result = self.app.execution.close_all()
+                result = self.app.close_all_from_telegram()
                 if result.get("success"):
                     self.send(
                         chat_id,

@@ -1,4 +1,5 @@
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 
 from khtb_lab.database import Database
 
@@ -116,4 +117,26 @@ def test_existing_trade_database_is_migrated_with_safe_management_defaults(
     assert trade['favorable_price']==100
     assert trade['entry_leverage'] is None
     assert trade['protection_order_id'] is None
+    db.close()
+
+
+def test_shared_sqlite_connection_serializes_concurrent_database_operations():
+    db=Database(':memory:')
+
+    def create_trade(index):
+        db.open_trade(
+            f'SYMBOL{index}/USDT',
+            'LONG',
+            100,
+            95,
+            110,
+            1,
+            source='DEMO',
+        )
+        return len(db.open_trades('DEMO'))
+
+    with ThreadPoolExecutor(max_workers=8) as workers:
+        list(workers.map(create_trade, range(80)))
+
+    assert len(db.open_trades('DEMO')) == 80
     db.close()

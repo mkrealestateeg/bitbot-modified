@@ -46,6 +46,10 @@ class KhtbLab:
         self.last_scan = "Never"
         self.last_result = "Not scanned"
         self.telegram = None
+        self.position_lock = threading.RLock()
+        self.scan_lock = threading.RLock()
+        self._position_manager_ready = False
+        self._position_manager_error = "position_manager_cycle_not_completed"
 
         self.market.load()
 
@@ -69,6 +73,18 @@ class KhtbLab:
             stop,
             risk_fraction,
         )
+
+    def _shared_lock(self, name):
+        lock = getattr(self, name, None)
+        if lock is None:
+            lock = threading.RLock()
+            setattr(self, name, lock)
+        return lock
+
+    def _invalidate_position_manager(self, reason):
+        self._position_manager_ready = False
+        self._position_manager_error = reason
+        self.execution.positions_reconciled = False
 
     def get_prices(self, symbols):
         prices = {}
@@ -381,6 +397,10 @@ class KhtbLab:
         return stop if valid else None
 
     def _manage_exchange_trades(self):
+        with self._shared_lock("position_lock"):
+            return self._manage_exchange_trades_locked()
+
+    def _manage_exchange_trades_locked(self):
         """Advance protection only for positions confirmed by reconciliation."""
         trades = self.db.open_trades(self.settings.trading_env)
         if not trades:
@@ -730,6 +750,10 @@ class KhtbLab:
         return all_ok
 
     def close_trade_from_telegram(self, trade_id):
+        with self._shared_lock("position_lock"):
+            return self._close_trade_from_telegram_locked(trade_id)
+
+    def _close_trade_from_telegram_locked(self, trade_id):
         trade = next(
             (
                 item
@@ -752,7 +776,14 @@ class KhtbLab:
             else:
                 result = self.execution.close_position(trade)
                 if not result.get("success"):
+                    if result.get("reconcile_required"):
+                        self._invalidate_position_manager(
+                            "telegram_close_requires_reconciliation"
+                        )
                     return result
+                self._invalidate_position_manager(
+                    "telegram_close_requires_reconciliation"
+                )
                 pnl = self.trade_pnl(trade, price)
                 close_reason = (
                     "EXCHANGE_CLOSED_ESTIMATED"
@@ -791,6 +822,15 @@ class KhtbLab:
                 "error": f"{type(exc).__name__}:{exc}",
                 "reconcile_required": True,
             }
+
+    def close_all_from_telegram(self):
+        with self._shared_lock("position_lock"):
+            result = self.execution.close_all()
+            if result.get("success") or result.get("reconcile_required"):
+                self._invalidate_position_manager(
+                    "telegram_close_all_requires_reconciliation"
+                )
+            return result
 
     def _settle_missing_exchange_trades(self, reconciliation):
         live_keys = reconciliation.get("live_position_keys")
@@ -876,6 +916,67 @@ class KhtbLab:
                     update["stop"],
                     update.get("order_id"),
                 )
+
+    def _reconcile_exchange_state(self):
+        with self._shared_lock("position_lock"):
+            reconciliation = self.execution.reconcile_positions(
+                self.db.open_trades(self.settings.trading_env)
+            )
+            self._sync_exchange_protection(reconciliation)
+            if (
+                not reconciliation.get("ok")
+                and self._settle_missing_exchange_trades(reconciliation)
+            ):
+                reconciliation = self.execution.reconcile_positions(
+                    self.db.open_trades(self.settings.trading_env)
+                )
+                self._sync_exchange_protection(reconciliation)
+            return reconciliation
+
+    def position_manager_once(self):
+        if self.settings.trading_env == "PAPER":
+            return True
+
+        with self._shared_lock("position_lock"):
+            try:
+                reconciliation = self._reconcile_exchange_state()
+                if not reconciliation.get("ok"):
+                    self._position_manager_ready = False
+                    self._position_manager_error = (
+                        reconciliation.get("mismatches")
+                        or reconciliation.get("reason")
+                        or "exchange_state_unreconciled"
+                    )
+                    self.execution.positions_reconciled = False
+                    log.critical(
+                        "POSITION MANAGER RECONCILIATION FAILED | "
+                        "reason=%s | mismatches=%s",
+                        reconciliation.get("reason"),
+                        reconciliation.get("mismatches"),
+                    )
+                    return False
+
+                log.info(
+                    "EXCHANGE STATE RECONCILED | positions=%s",
+                    reconciliation.get("live_positions", 0),
+                )
+                if not self._manage_exchange_trades():
+                    self._position_manager_ready = False
+                    self._position_manager_error = (
+                        "open_trade_protection_management_failed"
+                    )
+                    self.execution.positions_reconciled = False
+                    return False
+
+                self._position_manager_ready = True
+                self._position_manager_error = None
+                return True
+            except Exception:
+                self._position_manager_ready = False
+                self._position_manager_error = "position_manager_cycle_failed"
+                self.execution.positions_reconciled = False
+                log.exception("POSITION MANAGER CYCLE FAILED")
+                return False
 
     def opportunity_text(self, symbol, signal, ai=None):
         ai = ai or {}
@@ -991,25 +1092,31 @@ class KhtbLab:
         )
         return trade_id
 
-    def _notify_execution_result(self, symbol, direction, signal, result):
+    def _notify_execution_result(
+        self,
+        symbol,
+        direction,
+        signal,
+        result,
+        trade_id,
+        recording_error,
+    ):
         """Send truthful notifications about fills and protection status."""
 
         protection = result.get("protection") or {}
         protection_ok = protection.get("ok") is True
 
-        try:
-            trade_id = self._record_confirmed_fill(
-                symbol,
-                direction,
-                signal,
-                result,
-            )
-        except Exception:
-            log.exception(
+        if recording_error is not None:
+            log.error(
                 "CRITICAL: EXCHANGE FILL COULD NOT BE RECORDED | "
                 "symbol=%s | order_id=%s",
                 symbol,
                 result.get("order_id"),
+                exc_info=(
+                    type(recording_error),
+                    recording_error,
+                    recording_error.__traceback__,
+                ),
             )
             self.notify(
                 f"🚨 CRITICAL: EXCHANGE POSITION FILLED\n"
@@ -1425,7 +1532,28 @@ class KhtbLab:
             quantity,
         )
 
-        result = self.execution.execute(plan)
+        fill_trade_id = None
+        fill_recording_error = None
+        with self._shared_lock("position_lock"):
+            result = self.execution.execute(plan)
+            if result.get("success"):
+                try:
+                    fill_trade_id = self._record_confirmed_fill(
+                        symbol,
+                        direction,
+                        signal,
+                        result,
+                    )
+                except Exception as exc:
+                    fill_recording_error = exc
+            if (
+                result.get("success")
+                or result.get("executed")
+                or result.get("reconcile_required")
+            ):
+                self._invalidate_position_manager(
+                    "exchange_position_changed_since_manager_cycle"
+                )
 
         if result.get("success"):
             self._notify_execution_result(
@@ -1433,6 +1561,8 @@ class KhtbLab:
                 direction,
                 signal,
                 result,
+                trade_id=fill_trade_id,
+                recording_error=fill_recording_error,
             )
             return
 
@@ -1475,6 +1605,10 @@ class KhtbLab:
             )
 
     def scan_once(self, allow_auto=True):
+        with self._shared_lock("scan_lock"):
+            return self._scan_once_locked(allow_auto)
+
+    def _scan_once_locked(self, allow_auto=True):
         symbols = self.db.enabled_symbols()
         prices = {}
         errors = 0
@@ -1486,18 +1620,32 @@ class KhtbLab:
             log.exception("LOCAL TRADE MODEL REFRESH FAILED")
 
         if self.settings.trading_env != "PAPER":
-            reconciliation = self.execution.reconcile_positions(
-                self.db.open_trades(self.settings.trading_env)
-            )
-            self._sync_exchange_protection(reconciliation)
-            if not reconciliation.get("ok") and self._settle_missing_exchange_trades(
-                reconciliation
-            ):
-                reconciliation = self.execution.reconcile_positions(
-                    self.db.open_trades(self.settings.trading_env)
+            with self._shared_lock("position_lock"):
+                reconciliation = self._reconcile_exchange_state()
+                exchange_state_ok = bool(reconciliation.get("ok"))
+                if not exchange_state_ok:
+                    self._invalidate_position_manager(
+                        reconciliation.get("mismatches")
+                        or reconciliation.get("reason")
+                        or "exchange_state_unreconciled"
+                    )
+                else:
+                    log.info(
+                        "EXCHANGE STATE RECONCILED | positions=%s",
+                        reconciliation.get("live_positions", 0),
+                    )
+
+                manager_ready = (
+                    exchange_state_ok
+                    and getattr(self, "_position_manager_ready", False)
+                    and getattr(
+                        self.execution, "positions_reconciled", False
+                    )
                 )
-                self._sync_exchange_protection(reconciliation)
-            if not reconciliation.get("ok"):
+                if exchange_state_ok and not manager_ready:
+                    self.execution.positions_reconciled = False
+
+            if not exchange_state_ok:
                 errors += 1
                 allow_auto = False
                 log.critical(
@@ -1515,17 +1663,25 @@ class KhtbLab:
                         "Check open positions and SL/TP on Bitget. "
                         "No new automatic entries will be submitted."
                     )
-            else:
-                log.info(
-                    "EXCHANGE STATE RECONCILED | positions=%s",
-                    reconciliation.get("live_positions", 0),
+            elif not manager_ready:
+                errors += 1
+                allow_auto = False
+                log.critical(
+                    "AUTO EXECUTION BLOCKED | position_manager_state=%s",
+                    getattr(
+                        self,
+                        "_position_manager_error",
+                        "position_manager_cycle_not_completed",
+                    ),
                 )
-                if not self._manage_exchange_trades():
-                    errors += 1
-                    allow_auto = False
-                    log.critical(
-                        "AUTO EXECUTION BLOCKED | reason="
-                        "open_trade_protection_management_failed"
+                if self.mode == "AUTO":
+                    self.notify(
+                        "🚨 AUTO TRADING PAUSED FOR THIS SCAN\n"
+                        "The position manager has not completed a successful "
+                        "reconciliation and protection cycle.\n"
+                        f"Details: {getattr(self, '_position_manager_error', 'unknown')}\n"
+                        "Check open positions and SL/TP on Bitget. "
+                        "No new automatic entries will be submitted."
                     )
 
         log.info(
@@ -1687,6 +1843,7 @@ class KhtbLab:
         self.telegram = telegram
         stop_event = threading.Event()
         telegram_thread = None
+        position_manager_thread = None
 
         log.info(
             "KHTB LAB STARTED | env=%s | mode=%s | exchange=%s",
@@ -1694,6 +1851,33 @@ class KhtbLab:
             self.mode,
             self.settings.exchange_name,
         )
+
+        if self.settings.trading_env != "PAPER":
+            def position_manager_worker():
+                interval = max(
+                    1,
+                    int(
+                        getattr(
+                            self.settings,
+                            "position_manager_seconds",
+                            15,
+                        )
+                    ),
+                )
+                while not stop_event.is_set():
+                    try:
+                        self.position_manager_once()
+                    except Exception:
+                        log.exception("POSITION MANAGER WORKER FAILED")
+                    stop_event.wait(interval)
+
+            position_manager_thread = threading.Thread(
+                target=position_manager_worker,
+                name="PositionManagerWorker",
+                daemon=True,
+            )
+            position_manager_thread.start()
+            log.info("Position manager background thread launched")
 
         if telegram:
             def telegram_worker():
@@ -1733,5 +1917,18 @@ class KhtbLab:
                 if telegram_thread.is_alive():
                     log.warning(
                         "Telegram polling thread is still stopping after "
+                        "shutdown request"
+                    )
+            if position_manager_thread:
+                position_manager_thread.join(
+                    timeout=max(
+                        2,
+                        int(getattr(self.settings, "request_timeout", 15))
+                        + 2,
+                    )
+                )
+                if position_manager_thread.is_alive():
+                    log.warning(
+                        "Position manager thread is still stopping after "
                         "shutdown request"
                     )

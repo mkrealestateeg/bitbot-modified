@@ -1621,49 +1621,12 @@ class KhtbLab:
 
         if self.settings.trading_env != "PAPER":
             with self._shared_lock("position_lock"):
-                reconciliation = self._reconcile_exchange_state()
-                exchange_state_ok = bool(reconciliation.get("ok"))
-                if not exchange_state_ok:
-                    self._invalidate_position_manager(
-                        reconciliation.get("mismatches")
-                        or reconciliation.get("reason")
-                        or "exchange_state_unreconciled"
-                    )
-                else:
-                    log.info(
-                        "EXCHANGE STATE RECONCILED | positions=%s",
-                        reconciliation.get("live_positions", 0),
-                    )
-
                 manager_ready = (
-                    exchange_state_ok
-                    and getattr(self, "_position_manager_ready", False)
-                    and getattr(
-                        self.execution, "positions_reconciled", False
-                    )
+                    getattr(self, "_position_manager_ready", False)
+                    and getattr(self.execution, "positions_reconciled", False)
                 )
-                if exchange_state_ok and not manager_ready:
-                    self.execution.positions_reconciled = False
 
-            if not exchange_state_ok:
-                errors += 1
-                allow_auto = False
-                log.critical(
-                    "AUTO EXECUTION BLOCKED | exchange_state=%s | "
-                    "mismatches=%s",
-                    reconciliation.get("reason"),
-                    reconciliation.get("mismatches"),
-                )
-                if self.mode == "AUTO":
-                    self.notify(
-                        "🚨 AUTO TRADING PAUSED FOR THIS SCAN\n"
-                        "Bitget positions/protection do not match the "
-                        "bot's recorded trades, or reconciliation failed.\n"
-                        f"Details: {reconciliation.get('mismatches')}\n"
-                        "Check open positions and SL/TP on Bitget. "
-                        "No new automatic entries will be submitted."
-                    )
-            elif not manager_ready:
+            if not manager_ready:
                 errors += 1
                 allow_auto = False
                 log.critical(

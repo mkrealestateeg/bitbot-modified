@@ -85,16 +85,7 @@ def test_scan_once_processes_enabled_symbols_and_updates_status():
     app.local_learner = SimpleNamespace(
         refresh=lambda source: {"status": "WARMING", "samples": 0}
     )
-    reconciled = []
-
-    def reconcile(trades):
-        reconciled.append(trades)
-        return {"ok": True, "live_positions": 0}
-
-    app.execution = SimpleNamespace(
-        positions_reconciled=True,
-        reconcile_positions=reconcile,
-    )
+    app.execution = SimpleNamespace(positions_reconciled=True)
     app._position_manager_ready = True
     processed = []
 
@@ -107,7 +98,6 @@ def test_scan_once_processes_enabled_symbols_and_updates_status():
 
     assert processed == [("BTC/USDT", False), ("ETH/USDT", False)]
     assert result == "Completed scan; symbols=2; errors=0"
-    assert reconciled == [[]]
     assert app.last_scan != "Never"
     assert app.last_result == result
 
@@ -126,19 +116,8 @@ def test_scan_once_blocks_auto_entries_when_exchange_state_is_unreconciled():
     app.local_learner = SimpleNamespace(
         refresh=lambda source: {"status": "WARMING", "samples": 0}
     )
-    reconciled = []
-
-    def reconcile(trades):
-        reconciled.append(trades)
-        return {
-            "ok": False,
-            "reason": "exchange_state_mismatch",
-            "mismatches": ["untracked_exchange_position:BTCUSDT:LONG"],
-        }
-
-    app.execution = SimpleNamespace(
-        reconcile_positions=reconcile
-    )
+    app.execution = SimpleNamespace(positions_reconciled=False)
+    app._position_manager_ready = False
     processed = []
     app._process_symbol = lambda symbol, prices, allow_auto: processed.append(
         allow_auto
@@ -148,11 +127,10 @@ def test_scan_once_blocks_auto_entries_when_exchange_state_is_unreconciled():
 
     assert processed == [False]
     assert result == "Completed scan; symbols=1; errors=1"
-    assert reconciled == [[]]
     assert app._position_manager_ready is False
 
 
-def test_scan_reconciles_but_does_not_mark_manager_healthy():
+def test_scan_blocks_auto_entries_when_position_manager_is_not_ready():
     app = KhtbLab.__new__(KhtbLab)
     app.db = SimpleNamespace(
         enabled_symbols=lambda: ["BTC/USDT"],
@@ -168,16 +146,11 @@ def test_scan_reconciles_but_does_not_mark_manager_healthy():
     )
     app.execution = SimpleNamespace(
         positions_reconciled=False,
-        reconcile_positions=lambda trades: {
-            "ok": True,
-            "live_positions": 0,
-        },
     )
     processed = []
     app._process_symbol = lambda symbol, prices, allow_auto: processed.append(
         allow_auto
     )
-    app._sync_exchange_protection = lambda reconciliation: None
     app._position_manager_ready = False
 
     result = app.scan_once(allow_auto=True)
@@ -186,6 +159,29 @@ def test_scan_reconciles_but_does_not_mark_manager_healthy():
     assert result == "Completed scan; symbols=1; errors=1"
     assert app._position_manager_ready is False
     assert app.execution.positions_reconciled is False
+
+
+def test_scan_does_not_reconcile_exchange_state():
+    app = KhtbLab.__new__(KhtbLab)
+    app.db = SimpleNamespace(enabled_symbols=lambda: ["BTC/USDT"])
+    app.settings = SimpleNamespace(trading_env="DEMO")
+    app.mode = "MANUAL"
+    app.telegram = None
+    app.last_scan = "Never"
+    app.last_result = "Not scanned"
+    app.local_learner = SimpleNamespace(
+        refresh=lambda source: {"status": "WARMING", "samples": 0}
+    )
+    app.execution = SimpleNamespace(positions_reconciled=True)
+    app._position_manager_ready = True
+    app._reconcile_exchange_state = lambda: pytest.fail(
+        "scanner must not reconcile exchange state"
+    )
+    app._process_symbol = lambda symbol, prices, allow_auto: None
+
+    assert app.scan_once(allow_auto=True) == (
+        "Completed scan; symbols=1; errors=0"
+    )
 
 
 def test_position_manager_reconciles_then_manages_before_opening_auto_gate():
